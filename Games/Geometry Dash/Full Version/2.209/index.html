@@ -8,7 +8,7 @@
 <link rel="icon" href="ref/logo.png">
 <title>Geometry Dash 2.209</title>
 
-<!-- JSZip CDN for bundled zip downloads -->
+<!-- JSZip CDN for bundled zip downloads & texture pack extraction -->
 <script src="https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js"></script>
 
 <script>
@@ -106,11 +106,14 @@ canvas {
     <div id="gd-btn-save" style="padding: 10px 12px; color: #fff; cursor: pointer; border-radius: 4px; font-size: 13px; transition: background 0.15s;" onmouseover="this.style.background='#333'" onmouseout="this.style.background='transparent'">Save Progress</div>
     <div id="gd-btn-download" style="padding: 10px 12px; color: #fff; cursor: pointer; border-radius: 4px; font-size: 13px; transition: background 0.15s;" onmouseover="this.style.background='#333'" onmouseout="this.style.background='transparent'">Download Game Progress & Local Levels</div>
     <div id="gd-btn-import" style="padding: 10px 12px; color: #fff; cursor: pointer; border-radius: 4px; font-size: 13px; transition: background 0.15s;" onmouseover="this.style.background='#333'" onmouseout="this.style.background='transparent'">Import CCGameManager.dat/CCLocalLevels.dat</div>
+    <div id="gd-btn-import-tp" style="padding: 10px 12px; color: #fff; cursor: pointer; border-radius: 4px; font-size: 13px; transition: background 0.15s;" onmouseover="this.style.background='#333'" onmouseout="this.style.background='transparent'">Import Texturepack (zip)</div>
+    <div id="gd-btn-revert-tp" style="padding: 10px 12px; color: #ffd166; cursor: pointer; border-radius: 4px; font-size: 13px; transition: background 0.15s;" onmouseover="this.style.background='#333'" onmouseout="this.style.background='transparent'">Revert Textures (If Changed)</div>
     <div style="height: 1px; background: #333; margin: 4px 0;"></div>
     <div id="gd-btn-clear" style="padding: 10px 12px; color: #ff6b6b; cursor: pointer; border-radius: 4px; font-size: 13px; transition: background 0.15s;" onmouseover="this.style.background='#3a1c1c'" onmouseout="this.style.background='transparent'">Clear Data</div>
   </div>
 </div>
 <input type="file" id="gd-file-input" multiple accept=".dat" style="display: none;">
+<input type="file" id="gd-tp-input" accept=".zip,application/zip" style="display: none;">
 
 <!-- Network Interceptor & URL Routing -->
 <script>
@@ -371,26 +374,56 @@ canvas {
 })();
 </script>
 
-<!-- Robust IndexedDB Persistence & Manual Save Handler -->
+<!-- Robust IndexedDB Persistence, Texturepack Manager & Manual Save Handler -->
 <script>
 var isSyncing = false;
 var isRestoring = false;
 
-function syncFilesToDB(filePath, data) {
-  if (isRestoring) return;
+function openSaveDB(callback) {
   try {
     var req = indexedDB.open('gdwasm_saves', 1);
     req.onupgradeneeded = function () { req.result.createObjectStore('files'); };
-    req.onsuccess = function () {
-      try {
-        var db = req.result;
-        var tx = db.transaction('files', 'readwrite');
-        var store = tx.objectStore('files');
-        var buf = (data && data.buffer && data.byteLength !== undefined) ? data.buffer.slice(data.byteOffset, data.byteOffset + data.byteLength) : data;
-        if (buf) store.put(buf, filePath);
-      } catch (e) {}
-    };
-  } catch (e) {}
+    req.onsuccess = function () { callback(null, req.result); };
+    req.onerror = function (e) { callback(e, null); };
+  } catch (e) { callback(e, null); }
+}
+
+function syncFilesToDB(filePath, data) {
+  if (isRestoring) return;
+  openSaveDB(function (err, db) {
+    if (err || !db) return;
+    try {
+      var tx = db.transaction('files', 'readwrite');
+      var store = tx.objectStore('files');
+      var buf = (data && data.buffer && data.byteLength !== undefined) ? data.buffer.slice(data.byteOffset, data.byteOffset + data.byteLength) : data;
+      if (buf) store.put(buf, filePath);
+    } catch (e) {}
+  });
+}
+
+function ensureFsDir(fullFilePath) {
+  if (!Module || !Module.FS) return;
+  var parts = fullFilePath.split('/').filter(Boolean);
+  parts.pop();
+  var cur = '';
+  for (var i = 0; i < parts.length; i++) {
+    cur += '/' + parts[i];
+    try { Module.FS.stat(cur); } catch (e) {
+      try { Module.FS.mkdir(cur); } catch (e2) {}
+    }
+  }
+}
+
+function writeFileEverywhere(relPath, uint8Data) {
+  var clean = String(relPath).replace(/^\/+/, '').replace(/^Resources\//i, '');
+  if (!clean) return;
+  var targets = ['/Resources/' + clean, '/' + clean];
+  targets.forEach(function (targetPath) {
+    try {
+      ensureFsDir(targetPath);
+      Module.FS.writeFile(targetPath, uint8Data);
+    } catch (e) {}
+  });
 }
 
 function saveFS() {
@@ -431,6 +464,226 @@ function saveFS() {
   }
 }
 
+function normalizeTpEntryPath(entryName) {
+  var p = String(entryName || '').replace(/\\/g, '/').replace(/^\/+/, '');
+  if (!p || p.endsWith('/')) return null;
+  var parts = p.split('/');
+  if (parts.length > 1 && parts[0].toLowerCase() !== 'resources' && parts[0].toLowerCase() !== 'icons') {
+    var knownSubfolders = ['icons', 'audio', 'sfx', 'songs', 'fonts', 'sprites'];
+    if (knownSubfolders.indexOf(parts[0].toLowerCase()) === -1) {
+      p = parts.slice(1).join('/');
+    }
+  }
+  p = p.replace(/^Resources\//i, '');
+  if (!p) return null;
+  return p;
+}
+
+function isTextureAssetFile(relPath) {
+  return /\.(png|jpg|jpeg|webp)$/i.test(relPath);
+}
+
+// Detect core sprite sheets and bitmap font sheets that need matching atlas/fnt metrics
+function isBlockedSheetOrFont(relPath) {
+  var lower = relPath.toLowerCase();
+  var base = lower.split('/').pop();
+  if (/^gj_gamesheet/.test(base) || /^editor_gamesheet/.test(base) || /^fireaurosheet/.test(base)) {
+    return true;
+  }
+  if (lower.indexOf('/fonts/') !== -1 || lower.indexOf('fonts/') === 0 || /font/.test(base)) {
+    return true;
+  }
+  return false;
+}
+
+async function applyTexturePackZip(file) {
+  if (!window.__gdRuntimeReady || !Module || !Module.FS) {
+    alert("Game filesystem is not ready yet. Please wait for the game to finish loading.");
+    return;
+  }
+
+  const arrayBuffer = await file.arrayBuffer();
+  const zip = await JSZip.loadAsync(arrayBuffer);
+
+  const entries = [];
+  let skippedCount = 0;
+
+  zip.forEach(function (relativePath, zipEntry) {
+    if (!zipEntry.dir) {
+      var normalized = normalizeTpEntryPath(relativePath);
+      if (normalized && isTextureAssetFile(normalized)) {
+        if (isBlockedSheetOrFont(normalized)) {
+          skippedCount++;
+        } else {
+          entries.push({ path: normalized, entry: zipEntry });
+        }
+      }
+    }
+  });
+
+  if (entries.length === 0) {
+    alert(skippedCount > 0
+      ? "Skipped " + skippedCount + " mismatched sprite/font sheet(s) to prevent scrambled textures and text in 2.209."
+      : "No compatible image texture files (.png, .jpg, .webp) were found inside the zip.");
+    return;
+  }
+
+  isRestoring = true;
+  let changedCount = 0;
+
+  openSaveDB(async function (err, db) {
+    for (let i = 0; i < entries.length; i++) {
+      const item = entries[i];
+      const rel = item.path;
+      const bytes = new Uint8Array(await item.entry.async('arraybuffer'));
+      if (!bytes || !bytes.length) continue;
+
+      let existingBytes = null;
+      for (const candidate of ['/Resources/' + rel, '/' + rel]) {
+        try {
+          existingBytes = Module.FS.readFile(candidate);
+          if (existingBytes && existingBytes.length) break;
+        } catch (e) {}
+      }
+
+      const origKey = 'tp_orig::' + rel;
+      const customFlagKey = 'tp_custom::' + rel;
+
+      if (db) {
+        await new Promise((resolve) => {
+          try {
+            const tx = db.transaction('files', 'readwrite');
+            const store = tx.objectStore('files');
+            const getOrig = store.get(origKey);
+            getOrig.onsuccess = function () {
+              if (!getOrig.result) {
+                if (existingBytes && existingBytes.length) {
+                  const copy = existingBytes.buffer.slice(existingBytes.byteOffset, existingBytes.byteOffset + existingBytes.byteLength);
+                  store.put(copy, origKey);
+                  store.put('overwritten', customFlagKey);
+                } else {
+                  store.put('added', customFlagKey);
+                }
+              }
+              const bufCopy = bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength);
+              store.put(bufCopy, 'tp_active::' + rel);
+              tx.oncomplete = resolve;
+              tx.onerror = resolve;
+            };
+            getOrig.onerror = resolve;
+          } catch (e) { resolve(); }
+        });
+      }
+
+      writeFileEverywhere(rel, bytes);
+      changedCount++;
+    }
+
+    isRestoring = false;
+    saveFS();
+    var msg = "Applied " + changedCount + " texture file(s) safely.";
+    if (skippedCount > 0) msg += " (" + skippedCount + " sprite/font sheet(s) skipped.)";
+    alert(msg + " Reloading game...");
+    location.reload();
+  });
+}
+
+function revertCustomTextures() {
+  if (!window.__gdRuntimeReady || !Module || !Module.FS) {
+    alert("Game filesystem is not ready yet.");
+    return;
+  }
+
+  isRestoring = true;
+  openSaveDB(function (err, db) {
+    if (err || !db) {
+      isRestoring = false;
+      alert("Could not access save storage.");
+      return;
+    }
+
+    const tx = db.transaction('files', 'readwrite');
+    const store = tx.objectStore('files');
+    const keysReq = store.getAllKeys();
+    const valsReq = store.getAll();
+
+    tx.oncomplete = function () {
+      const keys = keysReq.result || [];
+      const vals = valsReq.result || [];
+      const origMap = new Map();
+      const customFlags = new Map();
+      const keysToDelete = [];
+
+      for (let i = 0; i < keys.length; i++) {
+        const k = String(keys[i]);
+        if (k.startsWith('tp_orig::')) {
+          origMap.set(k.slice('tp_orig::'.length), vals[i]);
+          keysToDelete.push(k);
+        } else if (k.startsWith('tp_custom::')) {
+          customFlags.set(k.slice('tp_custom::'.length), vals[i]);
+          keysToDelete.push(k);
+        } else if (k.startsWith('tp_active::')) {
+          keysToDelete.push(k);
+        }
+      }
+
+      if (origMap.size === 0 && customFlags.size === 0) {
+        isRestoring = false;
+        alert("No custom textures were changed.");
+        return;
+      }
+
+      let revertedCount = 0;
+
+      origMap.forEach(function (buf, rel) {
+        if (buf && buf.byteLength) {
+          const u8 = new Uint8Array(buf);
+          writeFileEverywhere(rel, u8);
+          revertedCount++;
+        }
+      });
+
+      customFlags.forEach(function (flagVal, rel) {
+        if (flagVal === 'added') {
+          ['/Resources/' + rel, '/' + rel].forEach(function (p) {
+            try { Module.FS.unlink(p); } catch (e) {}
+          });
+          revertedCount++;
+        }
+      });
+
+      const cleanupTx = db.transaction('files', 'readwrite');
+      const cleanupStore = cleanupTx.objectStore('files');
+      origMap.forEach(function (buf, rel) {
+        if (buf && buf.byteLength) {
+          cleanupStore.put(buf, 'Resources/' + rel);
+          cleanupStore.put(buf, rel);
+        }
+      });
+      customFlags.forEach(function (flagVal, rel) {
+        if (flagVal === 'added') {
+          cleanupStore.delete('Resources/' + rel);
+          cleanupStore.delete(rel);
+        }
+      });
+      keysToDelete.forEach(function (delKey) {
+        cleanupStore.delete(delKey);
+      });
+
+      cleanupTx.oncomplete = cleanupTx.onerror = function () {
+        isRestoring = false;
+        alert("Reverted " + revertedCount + " texture file(s)! Reloading game...");
+        location.reload();
+      };
+    };
+
+    tx.onerror = function () {
+      isRestoring = false;
+      alert("Failed to revert textures.");
+    };
+  });
+}
+
 // Menu UI interaction & manual triggers
 document.addEventListener('DOMContentLoaded', () => {
   const btn = document.getElementById('gd-menu-btn');
@@ -449,14 +702,14 @@ document.addEventListener('DOMContentLoaded', () => {
     e.stopPropagation();
   });
 
-  // 1. Save Progress
+  // Save Progress
   document.getElementById('gd-btn-save').addEventListener('click', () => {
     saveFS();
     alert('Progress saved successfully!');
     popup.style.display = 'none';
   });
 
-  // 2. Download Game Progress & Local Levels (.zip)
+  // Download Game Progress & Local Levels (.zip)
   document.getElementById('gd-btn-download').addEventListener('click', async () => {
     popup.style.display = 'none';
     saveFS(); 
@@ -495,7 +748,7 @@ document.addEventListener('DOMContentLoaded', () => {
     URL.revokeObjectURL(url);
   });
 
-  // 3. Import CCGameManager.dat / CCLocalLevels.dat
+  // Import CCGameManager.dat / CCLocalLevels.dat
   document.getElementById('gd-btn-import').addEventListener('click', () => {
     popup.style.display = 'none';
     document.getElementById('gd-file-input').click();
@@ -539,7 +792,35 @@ document.addEventListener('DOMContentLoaded', () => {
     this.value = '';
   });
 
-  // 4. Clear Data
+  // Import Texturepack (zip)
+  document.getElementById('gd-btn-import-tp').addEventListener('click', () => {
+    popup.style.display = 'none';
+    document.getElementById('gd-tp-input').click();
+  });
+
+  document.getElementById('gd-tp-input').addEventListener('change', async function(e) {
+    const file = e.target.files && e.target.files[0];
+    this.value = '';
+    if (!file) return;
+    if (!file.name.toLowerCase().endsWith('.zip')) {
+      alert("Please select a .zip texture pack file.");
+      return;
+    }
+    try {
+      await applyTexturePackZip(file);
+    } catch (err) {
+      isRestoring = false;
+      alert("Failed to import texture pack: " + (err && err.message ? err.message : err));
+    }
+  });
+
+  // Revert Textures (If Changed)
+  document.getElementById('gd-btn-revert-tp').addEventListener('click', () => {
+    popup.style.display = 'none';
+    revertCustomTextures();
+  });
+
+  // Clear Data
   document.getElementById('gd-btn-clear').addEventListener('click', () => {
     popup.style.display = 'none';
     if (!confirm("Are you sure you want to clear all your saved game data and local levels?")) return;
@@ -587,19 +868,37 @@ function restoreSavesBeforeBoot(callback) {
             return;
           }
           
+          const activeTextures = new Map();
+          const otherFiles = [];
+
           for (let i = 0; i < keys.length; i++) {
+            const k = String(keys[i]);
+            const res = vals[i];
+            if (!res || !res.byteLength) continue;
+            if (k.startsWith('tp_orig::') || k.startsWith('tp_custom::')) continue;
+            if (k.startsWith('tp_active::')) {
+              activeTextures.set(k.slice('tp_active::'.length), res);
+            } else {
+              otherFiles.push({ key: k, buf: res });
+            }
+          }
+
+          for (let i = 0; i < otherFiles.length; i++) {
             try {
-              var k = keys[i];
-              var res = vals[i];
-              if (res && res.byteLength) {
-                var s = String(k);
-                var filename = s.split('/').pop();
-                ['/Resources/' + filename, '/' + filename, '/AppData/' + filename].forEach(function(targetPath) {
-                  try { Module.FS.writeFile(targetPath, new Uint8Array(res)); } catch(e2) {}
-                });
-              }
+              var cleanRel = otherFiles[i].key.replace(/^\/+/, '').replace(/^Resources\//i, '');
+              if (activeTextures.has(cleanRel)) continue;
+              writeFileEverywhere(cleanRel, new Uint8Array(otherFiles[i].buf));
             } catch (e) {}
           }
+
+          activeTextures.forEach(function (buf, rel) {
+            try {
+              if (isTextureAssetFile(rel) && !isBlockedSheetOrFont(rel)) {
+                writeFileEverywhere(rel, new Uint8Array(buf));
+              }
+            } catch (e) {}
+          });
+
           callback();
         };
         tx.onerror = function() { callback(); };
@@ -609,6 +908,53 @@ function restoreSavesBeforeBoot(callback) {
 }
 
 let preloadedDataBuffer = null;
+
+function setLoadingText(msg) {
+  const overlay = document.getElementById('loading-overlay');
+  if (overlay && overlay.style.display !== 'none') {
+    overlay.innerText = msg;
+  }
+}
+
+async function loadDataWithLiveProgress(assetName, expectedSize) {
+  const overlay = document.getElementById('loading-overlay');
+  const totalBytes = (expectedSize && Number(expectedSize) > 0) ? Number(expectedSize) : 0;
+
+  if (window.GDAssets && typeof window.GDAssets.loadData === 'function') {
+    const startTime = performance.now();
+    let lastPct = -1;
+    let tickCount = 0;
+
+    const timer = setInterval(() => {
+      if (!overlay || overlay.style.display === 'none') return;
+      tickCount++;
+      const elapsedSec = Math.floor((performance.now() - startTime) / 1000);
+      if (totalBytes > 0) {
+        const estPct = Math.min(99, Math.floor((elapsedSec * 4)));
+        if (estPct !== lastPct) {
+          lastPct = estPct;
+          const mb = (totalBytes / (1024 * 1024)).toFixed(1);
+          overlay.innerText = `Downloading Game Data (${mb} MB)... ${estPct}% (${elapsedSec}s)`;
+        }
+      } else {
+        const dots = '.'.repeat((tickCount % 3) + 1);
+        overlay.innerText = `Downloading Game Data${dots} (${elapsedSec}s elapsed)`;
+      }
+    }, 350);
+
+    try {
+      const result = await window.GDAssets.loadData(assetName, expectedSize);
+      clearInterval(timer);
+      if (overlay) overlay.innerText = 'Game Data Downloaded (100%). Preparing Engine...';
+      return result;
+    } catch (err) {
+      clearInterval(timer);
+      throw err;
+    }
+  }
+
+  throw new Error('GDAssets.loadData is unavailable');
+}
 
 var Module = {
   canvas: document.getElementById('canvas'),
@@ -628,7 +974,11 @@ var Module = {
   },
   print: function (text) {},
   printErr: function (text) {},
-  setStatus: function (text) {},
+  setStatus: function (text) {
+    if (text) {
+      setLoadingText(text);
+    }
+  },
   instantiateWasm: function(imports, success) {
     if (window.GDAssets && window.GDAssets.instantiateWasm) {
       return window.GDAssets.instantiateWasm(imports, success);
@@ -645,7 +995,6 @@ var Module = {
 
     try { Module.FS.chdir('/Resources'); } catch (e) {}
 
-    // Synchronously restore saved files into MEMFS BEFORE engine boots
     restoreSavesBeforeBoot(function () {
       if (Module.FS && Module.FS.writeFile && !Module.FS.__hooked) {
         var origWrite = Module.FS.writeFile;
@@ -690,7 +1039,7 @@ async function gdStartAuto() {
   const overlay = document.getElementById('loading-overlay');
 
   try {
-    if (overlay) overlay.innerText = 'Initializing Asset Loader...';
+    setLoadingText('Initializing Asset Loader...');
     
     let scriptLoaded = false;
     for (const src of [
@@ -732,14 +1081,14 @@ async function gdStartAuto() {
       throw new Error("Asset manifest HTTP 404");
     }
 
-    if (overlay) overlay.innerText = 'Downloading (Data) Gzip files (0%)';
+    setLoadingText('Starting Game Data Download...');
 
-    preloadedDataBuffer = await window.GDAssets.loadData('gd_web.data', manifest.data.size);
+    preloadedDataBuffer = await loadDataWithLiveProgress('gd_web.data', manifest.data && manifest.data.size);
 
-    if (overlay) overlay.innerText = 'Loading Game Script...';
+    setLoadingText('Loading Game Script...');
     const loaderCode = await window.GDAssets.loadScript();
 
-    if (overlay) overlay.innerText = 'Starting Engine...';
+    setLoadingText('Starting Engine...');
     var s = document.createElement('script');
     s.textContent = loaderCode;
     document.body.appendChild(s);
